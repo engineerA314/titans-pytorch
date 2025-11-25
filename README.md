@@ -6,7 +6,14 @@
 
 Unofficial implementation of [Titans](https://arxiv.org/abs/2501.00663) in Pytorch.
 
-**Note:** This fork diverges from the original repository to strictly follow the **MAC (Memory As Context)** architecture described in the paper. While the original implementation explores experimental variations (like residual memory mixing), this fork aims for architectural correctness based on the paper's specifications.
+**Note:** This fork diverges from the original repository to strictly follow the architectures described in the paper. While the original implementation explores experimental variations (like residual memory mixing), this fork aims for architectural correctness based on the paper's specifications. This implementation includes all four variants proposed in the Titans paper:
+
+| Architecture          | Description           | Attention Type       | Memory Integration                    |
+| --------------------- | --------------------- | -------------------- | ------------------------------------- |
+| **MAC**               | Memory as Context     | Block/Sliding Window | Memory prepended as attention context |
+| **MAG**               | Memory as Gate        | Sliding Window       | Memory combined via learned gating    |
+| **MAL**               | Memory as Layer       | Sliding Window       | Memory applied before attention       |
+| **Pure Titans (LMM)** | Long-term Memory only | None                 | Standalone memory sequence model      |
 
 ### Key Architectural Alignments
 
@@ -59,7 +66,9 @@ retrieved, mem_state = mem(seq)
 assert seq.shape == retrieved.shape
 ```
 
-A transformer with the `MAC` configuration can be used as
+### MAC (Memory as Context)
+
+Segment-based architecture where memory is prepended as context to attention.
 
 ```python
 import torch
@@ -69,19 +78,89 @@ transformer = MemoryAsContextTransformer(
     num_tokens = 256,
     dim = 256,
     depth = 2,
-    segment_len = 128,              # local attention window size
+    segment_len = 128,              # segment/window size
     num_persist_mem_tokens = 4,
     num_longterm_mem_tokens = 16,
 )
 
 token_ids = torch.randint(0, 256, (1, 1023))
 
-loss = transformer(token_ids, return_loss = True) # (1, 1023, 256)
+loss = transformer(token_ids, return_loss = True)
 loss.backward()
 
 # after much training
+sampled = transformer.sample(token_ids[:, :4], 512)
+```
+
+### MAG (Memory as Gate)
+
+Sliding window attention combined with neural memory via gating.
+
+```python
+import torch
+from titans_pytorch import MemoryAsGateTransformer
+
+transformer = MemoryAsGateTransformer(
+    num_tokens = 256,
+    dim = 256,
+    depth = 2,
+    window_size = 64,               # sliding window size
+    num_persist_mem_tokens = 4,
+)
+
+token_ids = torch.randint(0, 256, (1, 1023))
+
+loss = transformer(token_ids, return_loss = True)
+loss.backward()
 
 sampled = transformer.sample(token_ids[:, :4], 512)
+```
+
+### MAL (Memory as Layer)
+
+Memory applied as a layer before sliding window attention.
+
+```python
+import torch
+from titans_pytorch import MemoryAsLayerTransformer
+
+transformer = MemoryAsLayerTransformer(
+    num_tokens = 256,
+    dim = 256,
+    depth = 2,
+    window_size = 64,               # sliding window size
+    num_persist_mem_tokens = 4,
+)
+
+token_ids = torch.randint(0, 256, (1, 1023))
+
+loss = transformer(token_ids, return_loss = True)
+loss.backward()
+
+sampled = transformer.sample(token_ids[:, :4], 512)
+```
+
+### Pure Titans (LMM)
+
+Long-term memory module only, without attention.
+
+```python
+import torch
+from titans_pytorch import TitansLMM
+
+model = TitansLMM(
+    num_tokens = 256,
+    dim = 256,
+    depth = 4,                      # number of memory layers
+    num_persist_mem_tokens = 4,
+)
+
+token_ids = torch.randint(0, 256, (1, 1023))
+
+loss = model(token_ids, return_loss = True)
+loss.backward()
+
+sampled = model.sample(token_ids[:, :4], 512)
 ```
 
 ## Experiments
@@ -90,10 +169,20 @@ sampled = transformer.sample(token_ids[:, :4], 512)
 $ pip install .[examples]
 ```
 
-Then modify `train_mac.py` and run it to query nature
+Training scripts are provided for each architecture:
 
 ```bash
+# MAC (Memory as Context)
 $ python train_mac.py
+
+# MAG (Memory as Gate)
+$ python train_mag.py
+
+# MAL (Memory as Layer)
+$ python train_mal.py
+
+# Pure Titans (LMM only)
+$ python train_titans.py
 ```
 
 ## Citations
