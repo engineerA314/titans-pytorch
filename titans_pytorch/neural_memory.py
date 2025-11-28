@@ -869,6 +869,11 @@ class NeuralMemory(Module):
 
         # fetch values from memory model
 
+        # queries will be rearranged to (b*h*n, c, d) shape
+        # weights need to match: either expand from (b*h, ...) to (b*h*n, ...) or rearrange from (b, n, ...) to (b*n, ...)
+        # queries shape after split_heads: (b, h, seq_len, d)
+        num_chunks = queries.shape[2] // chunk_size
+
         if weights_have_expanded_shape:
             weights = rearrange_dict_values(weights, 'b n ... -> (b n) ...')
 
@@ -965,10 +970,23 @@ class NeuralMemory(Module):
 
         # strict MAC: retrieval must use committed weights only (ignore uncommitted updates)
         batch = retrieve_seq.shape[0]
+        # expand weights across time chunks if they do not already carry a time dimension
+        def ensure_time_expanded(w: dict[str, Tensor]):
+            first_w = next(iter(w.values()))
+            first_init_shape = self.init_weight_shape[0]
+            has_time_dim = first_w.ndim > len(first_init_shape)
+            if has_time_dim:
+                return w
+            chunk_size = self.retrieve_chunk_size
+            seq_len = retrieve_seq.shape[-2]
+            next_seq_len = round_up_multiple(seq_len + 1, chunk_size)
+            num_chunks = next_seq_len // chunk_size
+            return repeat_dict_values(w, 'bh ... -> bh n ...', n = num_chunks)
+
         if not exists(weights):
-            retrieval_weights = self.init_weights(batch)
+            retrieval_weights = ensure_time_expanded(self.init_weights(batch))
         else:
-            retrieval_weights = weights
+            retrieval_weights = ensure_time_expanded(weights)
 
         retrieved = self.retrieve_memories(
             retrieve_seq,
@@ -1180,6 +1198,21 @@ class NeuralMemory(Module):
             past_state = next_state.states,
             updates = next_state.updates
         )
+
+        # If retrieval-only with initial (time-less) weights, expand weights across time chunks
+        # so that retrieve_memories will treat them as time-expanded and align with queries
+        first_weight = next(iter(retrieval_weights.values()))
+        first_init_shape = self.init_weight_shape[0]
+        has_time_dim = first_weight.ndim > len(first_init_shape)
+
+        if not has_time_dim:
+            chunk_size = self.retrieve_chunk_size
+            seq_len = retrieve_seq.shape[-2]
+            # in retrieve path, a leading pad is added when chunk_size > 1 or not single weight
+            # for initial committed weights, emulate the same effective length by adding +1 before rounding
+            next_seq_len = round_up_multiple(seq_len + 1, chunk_size)
+            num_chunks = next_seq_len // chunk_size
+            retrieval_weights = repeat_dict_values(retrieval_weights, 'bh ... -> bh n ...', n = num_chunks)
 
         retrieved = self.retrieve_memories(
             retrieve_seq,

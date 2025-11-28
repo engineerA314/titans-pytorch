@@ -342,6 +342,7 @@ def test_assoc_scan(
 @pytest.mark.parametrize('neural_mem_batch_size', (None, 64))
 @pytest.mark.parametrize('neural_mem_qkv_receives_diff_views', (False, True))
 @pytest.mark.parametrize('neural_mem_momentum', (False, True))
+@pytest.mark.parametrize('batch_size', (1, 2))
 def test_mac(
     seq_len,
     num_persist_mem_tokens,
@@ -350,7 +351,8 @@ def test_mac(
     neural_mem_weight_residual,
     neural_mem_batch_size,
     neural_mem_qkv_receives_diff_views,
-    neural_mem_momentum
+    neural_mem_momentum,
+    batch_size
 ):
     transformer = MemoryAsContextTransformer(
         num_tokens = 256,
@@ -368,21 +370,23 @@ def test_mac(
         )
     )
 
-    x = torch.randint(0, 256, (1, seq_len))
+    x = torch.randint(0, 256, (batch_size, seq_len))
 
     logits = transformer(x)
-    assert logits.shape == (1, seq_len, 256)
+    assert logits.shape == (batch_size, seq_len, 256)
 
 @pytest.mark.parametrize('sliding', (False, True))
 @pytest.mark.parametrize('mem_layers', ((), None))
 @pytest.mark.parametrize('longterm_mems', (0, 4, 16))
 @pytest.mark.parametrize('prompt_len', (4, 16))
+@pytest.mark.parametrize('batch_size', (1, 2))
 @torch_default_dtype(torch.float64)
 def test_mac_sampling(
     sliding,
     mem_layers,
     longterm_mems,
-    prompt_len
+    prompt_len,
+    batch_size
 ):
     transformer = MemoryAsContextTransformer(
         num_tokens = 256,
@@ -395,7 +399,7 @@ def test_mac_sampling(
         neural_memory_layers = mem_layers
     )
 
-    ids = torch.randint(0, 256, (1, 1023))
+    ids = torch.randint(0, 256, (batch_size, 1023))
 
     prompt = ids[:, :prompt_len]
 
@@ -1633,6 +1637,10 @@ def test_all_architectures_batch_independence(batch_size):
     seq_len = 16
     
     models = [
+        ('MAC', MemoryAsContextTransformer(
+            num_tokens = num_tokens, dim = dim, depth = 2,
+            segment_len = 8, neural_memory_layers = ()
+        )),
         ('MAG', MemoryAsGateTransformer(
             num_tokens = num_tokens, dim = dim, depth = 2,
             window_size = 8, neural_memory_layers = ()
@@ -1658,6 +1666,34 @@ def test_all_architectures_batch_independence(batch_size):
         for i in range(1, batch_size):
             assert torch.allclose(logits_batch[0], logits_batch[i], atol = 1e-5), \
                 f"{name}: batch items should be independent"
+
+
+@pytest.mark.parametrize('batch_size', (1, 2, 4))
+@pytest.mark.parametrize('with_memory', (False, True))
+def test_mac_batch_independence(batch_size, with_memory):
+    """Test MAC batch independence with and without neural memory."""
+    num_tokens = 64
+    dim = 16
+    seq_len = 32
+    
+    transformer = MemoryAsContextTransformer(
+        num_tokens = num_tokens,
+        dim = dim,
+        depth = 2,
+        segment_len = 1 if with_memory else 16,
+        neural_memory_layers = (1,) if with_memory else ()
+    )
+    transformer.eval()
+    
+    x_single = torch.randint(0, num_tokens, (1, seq_len))
+    x_batch = x_single.repeat(batch_size, 1)
+    
+    with torch.no_grad():
+        logits_batch = transformer(x_batch)
+    
+    for i in range(1, batch_size):
+        assert torch.allclose(logits_batch[0], logits_batch[i], atol = 1e-5), \
+            f"MAC (with_memory={with_memory}): batch items should be independent"
 
 
 # ============================================================================
