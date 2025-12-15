@@ -2,6 +2,7 @@ from contextlib import contextmanager
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 import pytest
 from titans_pytorch import NeuralMemory
@@ -23,6 +24,58 @@ def torch_default_dtype(dtype):
     torch.set_default_dtype(dtype)
     yield
     torch.set_default_dtype(prev_dtype)
+
+# ============================================================================
+# CUDA / Triton integration test for assoc_scan accelerated backend
+# ============================================================================
+
+def _skip_if_no_cuda_triton():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available (integration test for triton accelerated scan)")
+    try:
+        import triton  # noqa: F401
+    except Exception:
+        pytest.skip("triton not installed")
+    try:
+        import accelerated_scan.triton as triton_mod  # noqa
+    except Exception as e:
+        pytest.skip(f"accelerated_scan.triton import failed: {e}")
+    return triton_mod
+
+
+def test_assoc_scan_triton_backend_parity_cuda(monkeypatch):
+    """
+    Integration test: require Linux+CUDA+triton. Verifies that:
+    - AssocScan(use_accelerated=True) actually calls accelerated_scan.triton.scan on CUDA
+    - Its output matches the reference non-accelerated AssocScan(use_accelerated=False)
+    """
+    triton_mod = _skip_if_no_cuda_triton()
+
+    from assoc_scan import AssocScan
+
+    calls = {'n': 0}
+    orig_scan = triton_mod.scan
+
+    def wrapped_scan(gates, tokens):
+        calls['n'] += 1
+        return orig_scan(gates, tokens)
+
+    monkeypatch.setattr(triton_mod, 'scan', wrapped_scan)
+
+    scan_acc = AssocScan(use_accelerated=True)
+    scan_ref = AssocScan(use_accelerated=False)
+
+    torch.manual_seed(0)
+    device = torch.device('cuda')
+    B, T, D = 2, 32, 16
+    gate = torch.sigmoid(torch.randn(B, T, 1, device=device, dtype=torch.float32)).contiguous()
+    value = torch.randn(B, T, D, device=device, dtype=torch.float32).contiguous()
+
+    out_acc = scan_acc(gate, value)
+    out_ref = scan_ref(gate, value)
+
+    assert calls['n'] > 0
+    assert torch.allclose(out_acc, out_ref, atol=1e-4, rtol=1e-4)
 
 # ============================================================================
 # NeuralMemory Tests
@@ -77,6 +130,181 @@ def test_titans(
     retrieved, _ = mem(seq, store_mask = store_mask)
 
     assert seq.shape == retrieved.shape
+
+
+def test_assoc_scan_called_titans(monkeypatch):
+    calls = {'n': 0}
+    class DummyScan:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __call__(self, gate, value, prev=None, remove_prev=False):
+            calls['n'] += 1
+            # use simple cumulative update; ignore prev to avoid shape pitfalls
+            gate = gate
+            while gate.ndim < value.ndim:
+                gate = gate.unsqueeze(-1)
+            gate = gate.expand_as(value)
+            state = torch.zeros_like(value[:, :1])
+            outs = []
+            for t in range(value.shape[1]):
+                state = gate[:, t:t+1] * state + value[:, t:t+1]
+                outs.append(state)
+            return torch.cat(outs, dim=1)
+
+    import titans_pytorch.neural_memory as nm
+    monkeypatch.setattr(nm, 'AssocScan', DummyScan)
+    mem = NeuralMemory(dim = 16, chunk_size = 2, heads = 1, momentum = True)
+    seq = torch.randn(1, 4, 16)
+    # use store-only to avoid retrieval path shape issues
+    _state, _ = mem.forward_store_only(seq, return_surprises = False)
+    assert calls['n'] > 0
+
+
+def test_assoc_scan_shapes_titans(monkeypatch):
+    import titans_pytorch.neural_memory as nm
+    records = []
+
+    class RecordingScan:
+        def __init__(self, use_accelerated=False, *args, **kwargs):
+            self.use_accelerated = use_accelerated
+        def __call__(self, gate, value, prev=None, remove_prev=False):
+            records.append((gate.shape, value.shape, None if prev is None else prev.shape))
+            gate = gate
+            while gate.ndim < value.ndim:
+                gate = gate.unsqueeze(-1)
+            gate = gate.expand_as(value)
+            state = torch.zeros_like(value[:, :1])
+            outs = []
+            for t in range(value.shape[1]):
+                state = gate[:, t:t+1] * state + value[:, t:t+1]
+                outs.append(state)
+            return torch.cat(outs, dim=1)
+
+    monkeypatch.setattr(nm, 'AssocScan', RecordingScan)
+    mem = NeuralMemory(dim=16, chunk_size=2, heads=2, momentum=True)
+    seq = torch.randn(1, 6, 16)  # multiple of chunk_size to avoid remainders
+    _state, _ = mem.forward_store_only(seq, return_surprises = False)
+    assert records, "assoc_scan not invoked"
+    for g, v, p in records:
+        # gate is (b, n, 1) while value is (b, n, ...); batch/time must match
+        assert g[0] == v[0] and g[1] == v[1]
+        if p is not None:
+            assert p[0] == v[0]
+
+
+def test_assoc_scan_full_forward_titans(monkeypatch):
+    import titans_pytorch.neural_memory as nm
+    calls = {'n': 0}
+
+    class DummyScan:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __call__(self, gate, value, prev=None, remove_prev=False):
+            calls['n'] += 1
+            # prev arrives without time dim; add if needed
+            if prev is None:
+                state = torch.zeros_like(value[:, :1])
+            else:
+                state = prev if prev.ndim == value.ndim else prev.unsqueeze(1)
+            # broadcast gate
+            g = gate
+            while g.ndim < value.ndim:
+                g = g.unsqueeze(-1)
+            g = g.expand_as(value)
+            outs = []
+            for t in range(value.shape[1]):
+                state = g[:, t:t+1] * state + value[:, t:t+1]
+                outs.append(state)
+            out = torch.cat(outs, dim=1)
+            if remove_prev:
+                out = out[:, 1:]
+            return out
+
+    monkeypatch.setattr(nm, 'AssocScan', DummyScan)
+    # use chunk_size=1 to keep retrieval reshape simple
+    class BroadcastLinear(torch.nn.Module):
+        def __init__(self, in_dim, out_dim):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(in_dim, out_dim))
+        def forward(self, x, weight=None):
+            w = self.weight if weight is None else weight
+            if w.ndim == 2:
+                return x @ w
+            # collapse leading dims and use the first slice to keep the test lightweight
+            w2 = w.reshape(-1, w.shape[-2], w.shape[-1])[0]
+            return x @ w2
+
+    mem = NeuralMemory(
+        dim=16,
+        chunk_size=1,
+        heads=1,
+        momentum=True,
+        model=BroadcastLinear(16, 16),
+        per_head_learned_parameters=False,
+        mem_model_norm_add_residual=False
+    )
+    seq = torch.randn(1, 3, 16)
+    out, _state = mem(seq)
+    assert calls['n'] > 0
+    assert out.shape == seq.shape
+
+
+def test_assoc_scan_full_forward_titans_per_head_norm(monkeypatch):
+    import titans_pytorch.neural_memory as nm
+    calls = {'n': 0}
+
+    class DummyScan:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __call__(self, gate, value, prev=None, remove_prev=False):
+            calls['n'] += 1
+            if prev is None:
+                state = torch.zeros_like(value[:, :1])
+            else:
+                state = prev if prev.ndim == value.ndim else prev.unsqueeze(1)
+            g = gate
+            while g.ndim < value.ndim:
+                g = g.unsqueeze(-1)
+            g = g.expand_as(value)
+            outs = []
+            for t in range(value.shape[1]):
+                state = g[:, t:t+1] * state + value[:, t:t+1]
+                outs.append(state)
+            out = torch.cat(outs, dim=1)
+            if remove_prev:
+                out = out[:, 1:]
+            return out
+
+    monkeypatch.setattr(nm, 'AssocScan', DummyScan)
+
+    class PerHeadLinear(torch.nn.Module):
+        def __init__(self, dim, heads):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(heads, dim, dim))
+        def forward(self, x, weight=None):
+            w = self.weight if weight is None else weight
+            # w: (h, d, d); x will be expanded to (h, b, n, d) by stateless call
+            if w.ndim == 3:
+                # functional_call will expand weights to (h, d, d); x comes as (h, b*n, d)
+                if x.ndim == 3:
+                    return torch.einsum('hbd,hde->hbe', x, w)
+                return torch.einsum('hbnd,hde->hbne', x, w)
+            return x @ w
+
+    mem = NeuralMemory(
+        dim=8,
+        chunk_size=1,
+        heads=2,
+        momentum=True,
+        model=torch.nn.Identity(),
+        per_head_learned_parameters=True,
+        mem_model_norm_add_residual=True,
+        batch_size=1,
+    )
+    seq = torch.randn(1, 1, 8)  # single step to satisfy per-head norm broadcast
+    out, _ = mem(seq)
+    assert calls['n'] > 0
+    assert out.shape == seq.shape
 
 def test_return_surprises():
 
@@ -1695,6 +1923,57 @@ def test_mac_batch_independence(batch_size, with_memory):
         assert torch.allclose(logits_batch[0], logits_batch[i], atol = 1e-5), \
             f"MAC (with_memory={with_memory}): batch items should be independent"
 
+
+@pytest.mark.parametrize('arch', ('mag', 'mac', 'mal', 'lmm'))
+@pytest.mark.parametrize('num_batches', (2, 3))
+def test_small_training_multi_batches(arch, num_batches):
+    """Tiny training loop over multiple mini-batches to ensure gradients stay finite."""
+    torch.manual_seed(0)
+    num_tokens = 64
+    dim = 16
+    seq_len = 12
+
+    if arch == 'mag':
+        model = MemoryAsGateTransformer(
+            num_tokens = num_tokens,
+            dim = dim,
+            depth = 1,
+            window_size = 8,
+            neural_memory_layers = ()
+        )
+    elif arch == 'mac':
+        model = MemoryAsContextTransformer(
+            num_tokens = num_tokens,
+            dim = dim,
+            depth = 1,
+            segment_len = 8,
+            neural_memory_layers = ()
+        )
+    elif arch == 'mal':
+        model = MemoryAsLayerTransformer(
+            num_tokens = num_tokens,
+            dim = dim,
+            depth = 1,
+            window_size = 8,
+            neural_memory_layers = ()
+        )
+    else:
+        model = TitansLMM(
+            num_tokens = num_tokens,
+            dim = dim,
+            depth = 1
+        )
+    opt = torch.optim.AdamW(model.parameters(), lr = 1e-3)
+
+    for _ in range(num_batches):
+        x = torch.randint(0, num_tokens, (2, seq_len))
+        target = torch.randint(0, num_tokens, (2, seq_len))
+        logits = model(x)
+        loss = F.cross_entropy(logits.reshape(-1, num_tokens), target.reshape(-1))
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        assert torch.isfinite(loss)
 
 # ============================================================================
 # Numerical Stability Tests

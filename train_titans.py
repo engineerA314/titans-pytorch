@@ -17,26 +17,49 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from adam_atan2_pytorch import AdoptAtan2
-
 from titans_pytorch import (
     TitansLMM,
     MemoryMLP,
     MemoryAttention
 )
 
-# constants
+# constants (overridable via CLI)
+import argparse
 
-NUM_BATCHES = int(1e5)
-BATCH_SIZE = 4
-GRADIENT_ACCUMULATE_EVERY = 4
-LEARNING_RATE = 2e-4
-VALIDATE_EVERY = 100
-GENERATE_EVERY = 500
-PRIME_LENGTH = 100
-GENERATE_LENGTH = 512
-SHOULD_GENERATE = True
-SEQ_LEN = 512
+parser = argparse.ArgumentParser()
+parser.add_argument("--device", type=str, default=None, choices=["cpu", "cuda", "mps", "auto"])
+parser.add_argument("--num-batches", type=int, default=int(1e5))
+parser.add_argument("--batch-size", type=int, default=4)
+parser.add_argument("--grad-accum", type=int, default=4)
+parser.add_argument("--learning-rate", type=float, default=2e-4)
+parser.add_argument("--validate-every", type=int, default=100)
+parser.add_argument("--generate-every", type=int, default=500)
+parser.add_argument("--prime-length", type=int, default=100)
+parser.add_argument("--generate-length", type=int, default=512)
+parser.add_argument("--should-generate", action="store_true", default=True)
+parser.add_argument("--seq-len", type=int, default=512)
+parser.add_argument("--data-path", type=str, default="./data/enwik8.gz")
+# model size overrides
+parser.add_argument("--dim", type=int, default=256)
+parser.add_argument("--depth", type=int, default=2)
+parser.add_argument("--heads", type=int, default=4)
+parser.add_argument("--dim-head", type=int, default=64)
+# wandb toggle
+parser.add_argument("--wandb", action="store_true", help="Enable wandb logging if installed")
+parser.add_argument("--use-accelerated-scan", action="store_true", help="Enable accelerated assoc_scan backend when available")
+args, _ = parser.parse_known_args()
+
+NUM_BATCHES = args.num_batches
+BATCH_SIZE = args.batch_size
+GRADIENT_ACCUMULATE_EVERY = args.grad_accum
+LEARNING_RATE = args.learning_rate
+VALIDATE_EVERY = args.validate_every
+GENERATE_EVERY = args.generate_every
+PRIME_LENGTH = args.prime_length
+GENERATE_LENGTH = args.generate_length
+SHOULD_GENERATE = args.should_generate
+SEQ_LEN = args.seq_len
+USE_ACCELERATED_SCAN = args.use_accelerated_scan
 
 # neural memory related
 
@@ -57,14 +80,25 @@ WANDB_ONLINE = False
 
 # perf related
 
-USE_ACCELERATED_SCAN = True
+import argparse
 
-# wandb experiment tracker
+# wandb experiment tracker (optional)
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
-import wandb
-wandb.init(project = PROJECT_NAME, mode = 'disabled' if not WANDB_ONLINE else 'online')
-wandb.run.name = RUN_NAME
-wandb.run.save()
+# optional wandb setup (disabled by default unless --wandb and installed)
+wandb_log = lambda data: None
+if args.wandb:
+    if WANDB_AVAILABLE:
+        wandb.init(project=PROJECT_NAME, mode='online' if WANDB_ONLINE else 'disabled')
+        wandb.run.name = RUN_NAME
+        wandb.run.save()
+        wandb_log = wandb.log
+    else:
+        print("wandb not installed; skipping wandb logging.")
 
 # helpers
 
@@ -93,52 +127,64 @@ else:
 
 # instantiate pure titans (LMM only)
 
+def pick_device():
+    if args.device and args.device != "auto":
+        return torch.device(args.device)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+device = pick_device()
+
 model = TitansLMM(
     num_tokens = 256,
-    dim = 384,
-    depth = MODEL_DEPTH,
+    dim = args.dim,
+    depth = args.depth,
     num_persist_mem_tokens = NUM_PERSIST_MEM,
     neural_memory_model = neural_memory_model,
     neural_memory_kwargs = dict(
-        dim_head = 64,
-        heads = 4,
+        dim_head = args.dim_head,
+        heads = args.heads,
         qk_rmsnorm = NEURAL_MEM_QK_NORM,
         momentum = NEURAL_MEM_MOMENTUM,
         momentum_order = NEURAL_MEM_MOMENTUM_ORDER,
         default_step_transform_max_lr = NEURAL_MEM_MAX_LR,
         use_accelerated_scan = USE_ACCELERATED_SCAN,
     )
-).cuda()
+).to(device)
 
 # prepare enwik8 data
 
-with gzip.open('./data/enwik8.gz') as file:
+with gzip.open(args.data_path) as file:
     data = np.frombuffer(file.read(int(95e6)), dtype = np.uint8).copy()
     data_train, data_val = np.split(data, [int(90e6)])
     data_train, data_val = map(torch.from_numpy, (data_train, data_val))
 
 class TextSamplerDataset(Dataset):
-    def __init__(self, data, seq_len):
+    def __init__(self, data, seq_len, device):
         super().__init__()
         self.data = data
         self.seq_len = seq_len
+        self.device = device
 
     def __getitem__(self, index):
         rand_start = torch.randint(0, self.data.size(0) - self.seq_len, (1,))
         full_seq = self.data[rand_start: rand_start + self.seq_len + 1].long()
-        return full_seq.cuda()
+        return full_seq.to(self.device)
 
     def __len__(self):
         return self.data.size(0) // self.seq_len
 
-train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
-val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
+train_dataset = TextSamplerDataset(data_train, SEQ_LEN, device)
+val_dataset = TextSamplerDataset(data_val, SEQ_LEN, device)
 train_loader = cycle(DataLoader(train_dataset, batch_size = BATCH_SIZE))
 val_loader = cycle(DataLoader(val_dataset, batch_size = BATCH_SIZE))
 
 # optimizer
 
-optim = AdoptAtan2(model.parameters(), lr = LEARNING_RATE)
+optim = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
 
 # training
 
@@ -153,7 +199,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training'):
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optim.step()
     optim.zero_grad()
-    wandb.log(dict(loss = loss.item()))
+    wandb_log(dict(loss = loss.item()))
 
     if i % VALIDATE_EVERY == 0:
         model.eval()
