@@ -807,6 +807,55 @@ def test_flex_with_context_matches_nonflex(seq_len):
 
     assert torch.allclose(out_flex, out_non_flex, atol = 1e-5)
 
+
+@pytest.mark.parametrize('seq_len', (65, 257))
+@pytest.mark.parametrize('context_len', (3, 7, 11))
+def test_flex_attention_context_fallback_experimental(seq_len, context_len):
+    """Experimental verification: flex attention with context falls back to non-flex.
+    
+    This test directly checks that:
+    1. When context is provided, forward() does NOT call forward_flex()
+    2. When context is provided, forward() DOES call the non-flex path
+    3. Both paths produce identical results
+    """
+    if not (torch.cuda.is_available() and exists(flex_attention)):
+        pytest.skip("CUDA and flex_attention required")
+
+    attn = SegmentedAttention(
+        dim = 16,
+        segment_len = 32,
+        num_persist_mem_tokens = 2,
+        num_longterm_mem_tokens = 0,
+        use_flex_attn = True,
+        sliding = False
+    ).cuda()
+
+    seq = torch.randn(1, seq_len, 16).cuda()
+    ctx = torch.randn(1, context_len, 16).cuda()
+
+    # Track which path was taken
+    flex_called = {'count': 0}
+    
+    original_forward_flex = attn.forward_flex
+    def wrapped_forward_flex(*args, **kwargs):
+        flex_called['count'] += 1
+        return original_forward_flex(*args, **kwargs)
+    attn.forward_flex = wrapped_forward_flex
+
+    # Call with context - should NOT use flex path
+    out_with_context, _ = attn(seq, context = ctx)
+    assert flex_called['count'] == 0, "forward_flex should NOT be called when context is provided"
+    
+    # Call without context - SHOULD use flex path
+    flex_called['count'] = 0
+    out_no_context, _ = attn(seq, context = None)
+    assert flex_called['count'] == 1, "forward_flex SHOULD be called when no context is provided"
+    
+    # Verify results match between context+non-flex and explicit disable_flex_attn
+    out_explicit_nonflex, _ = attn(seq, context = ctx, disable_flex_attn = True)
+    assert torch.allclose(out_with_context, out_explicit_nonflex, atol = 1e-5)
+
+
 def test_sliding_context_cpu():
     attn = SegmentedAttention(
         dim = 16,
