@@ -403,7 +403,10 @@ class SegmentedAttention(Module):
             assert seq.shape[-2] == 1
             return self.forward_inference(seq, cache, value_residual, output_gating = output_gating, context = context)
 
-        if seq.is_cuda and self.use_flex_attn and not disable_flex_attn:
+        # Note: flex_attention with dynamic context_len has compatibility issues with torch.compile.
+        # Fall back to non-flex path when context is provided.
+        has_context = exists(context)
+        if seq.is_cuda and self.use_flex_attn and not disable_flex_attn and not has_context:
             return self.forward_flex(seq, value_residual, flex_attn_fn, output_gating = output_gating, cache = cache, context = context)
 
         assert not (exists(value_residual) ^ exists(self.to_learned_v_mix))

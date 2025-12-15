@@ -36,6 +36,8 @@ parser.add_argument("--depth", type=int, default=2)
 parser.add_argument("--heads", type=int, default=4)
 parser.add_argument("--dim-head", type=int, default=64)
 parser.add_argument("--use-accelerated-scan", action="store_true", help="Enable accelerated assoc_scan backend when available")
+parser.add_argument("--wandb", action="store_true", help="Enable wandb logging if installed")
+parser.add_argument("--no-flex-attn", action="store_true", help="Disable flex attention (for environments without triton support)")
 args, _ = parser.parse_known_args()
 
 NUM_BATCHES = args.num_batches
@@ -79,7 +81,7 @@ WANDB_ONLINE = False # turn this on to pipe experiment to cloud
 
 # perf related
 
-USE_FLEX_ATTN = True
+USE_FLEX_ATTN = not args.no_flex_attn
 USE_FAST_INFERENCE = False
 
 # wandb experiment tracker (optional)
@@ -123,6 +125,19 @@ else:
         dim = 64,
         depth = NEURAL_MEMORY_DEPTH
     )
+
+# device selection
+
+def pick_device():
+    if args.device and args.device != "auto":
+        return torch.device(args.device)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+device = pick_device()
 
 # instantiate memory-as-context transformer
 
@@ -176,17 +191,6 @@ class TextSamplerDataset(Dataset):
 
     def __len__(self):
         return self.data.size(0) // self.seq_len
-
-def pick_device():
-    if args.device and args.device != "auto":
-        return torch.device(args.device)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-device = pick_device()
 
 train_dataset = TextSamplerDataset(data_train, SEQ_LEN, device)
 val_dataset   = TextSamplerDataset(data_val, SEQ_LEN, device)

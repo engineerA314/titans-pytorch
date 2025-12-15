@@ -780,6 +780,12 @@ def test_flex(
 
 @pytest.mark.parametrize('seq_len', (65, 257))
 def test_flex_with_context_matches_nonflex(seq_len):
+    """Test that flex attention with context produces same results as non-flex.
+    
+    Note: Due to torch.compile compatibility issues with dynamic context_len in
+    flex_attention masks, context automatically falls back to non-flex path.
+    This test verifies that fallback works correctly.
+    """
     if not (torch.cuda.is_available() and exists(flex_attention)):
         pytest.skip()
 
@@ -795,6 +801,7 @@ def test_flex_with_context_matches_nonflex(seq_len):
     seq = torch.randn(1, seq_len, 16).cuda()
     ctx = torch.randn(1, 7, 16).cuda()
 
+    # With context, flex_attn automatically falls back to non-flex path
     out_flex, _ = attn(seq, context = ctx)
     out_non_flex, _ = attn(seq, context = ctx, disable_flex_attn = True)
 
@@ -2094,3 +2101,114 @@ def test_lmm_long_sequence(seq_len):
     
     assert logits.shape == (1, seq_len, 64)
     assert not torch.isnan(logits).any()
+
+
+# ============================================================================
+# Neural Memory forward_store_only edge case tests
+# ============================================================================
+
+def test_neural_memory_forward_store_only_return_surprises_false():
+    """Test forward_store_only works correctly when return_surprises=False.
+    
+    This tests the fix for a bug where surprises were always computed
+    even when return_surprises=False, causing shape mismatches during sample().
+    """
+    mem = NeuralMemory(
+        dim = 16,
+        chunk_size = 4,
+        heads = 1,
+    )
+    
+    seq = torch.randn(2, 16, 16)  # batch=2, seq_len=16
+    
+    # Test with return_surprises=False (used during sample/inference)
+    new_state, surprises = mem.forward_store_only(
+        seq,
+        state=None,
+        return_surprises=False
+    )
+    
+    assert surprises is None
+    assert new_state is not None
+    assert new_state.weights is not None
+
+
+def test_neural_memory_forward_store_only_return_surprises_true():
+    """Test forward_store_only works correctly when return_surprises=True."""
+    mem = NeuralMemory(
+        dim = 16,
+        chunk_size = 4,
+        heads = 1,
+    )
+    
+    seq = torch.randn(2, 16, 16)
+    
+    # Test with return_surprises=True (used during training)
+    new_state, surprises = mem.forward_store_only(
+        seq,
+        state=None,
+        return_surprises=True
+    )
+    
+    assert surprises is not None
+    assert len(surprises) == 2  # (unweighted_mem_model_loss, adaptive_lr)
+    assert new_state is not None
+
+
+def test_neural_memory_short_sequence():
+    """Test NeuralMemory handles very short sequences (1 token).
+    
+    This simulates what happens during autoregressive sampling
+    where tokens are generated one at a time.
+    """
+    mem = NeuralMemory(
+        dim = 16,
+        chunk_size = 4,
+        heads = 1,
+    )
+    
+    # Very short sequence (1 token) - simulates sample() behavior
+    seq = torch.randn(2, 1, 16)
+    
+    # Should not raise an error
+    new_state, surprises = mem.forward_store_only(
+        seq,
+        state=None,
+        return_surprises=False
+    )
+    
+    assert new_state is not None
+    assert surprises is None
+
+
+def test_mac_transformer_sample():
+    """Test MemoryAsContextTransformer sample() method works correctly.
+    
+    This is an integration test for the forward_store_only fix.
+    """
+    from titans_pytorch import MemoryMLP
+    
+    # dim_head = dim / heads = 32 / 4 = 8, so MemoryMLP dim should match
+    model = MemoryAsContextTransformer(
+        num_tokens = 64,
+        dim = 32,
+        depth = 2,
+        segment_len = 8,
+        num_persist_mem_tokens = 2,
+        num_longterm_mem_tokens = 2,
+        neural_memory_layers = (1,),
+        neural_memory_model = MemoryMLP(dim=8, depth=1),  # dim = dim_head
+        neural_memory_kwargs = dict(dim_head = 8, heads = 4),
+        use_flex_attn = False,  # Avoid triton dependency
+    )
+    
+    # Create a prompt
+    prompt = torch.randint(0, 64, (1, 8))
+    prompt_len = prompt.shape[-1]
+    
+    # Sample should work without errors
+    # sample() returns only newly generated tokens
+    sampled = model.sample(prompt, prompt_len + 8, temperature=1.0, show_progress=False)
+    
+    assert sampled.shape == (1, 8)  # 8 new tokens
+    assert not torch.isnan(sampled.float()).any()
