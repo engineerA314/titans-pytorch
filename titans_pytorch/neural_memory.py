@@ -186,6 +186,152 @@ def newtonschulz5(
 
     return inv_pack(t)
 
+# manual gradient helpers for replacing vmap(grad(forward_and_loss))
+
+def _gelu_backward(x: Tensor, grad_output: Tensor) -> Tensor:
+    """Manual GELU backward: gelu'(x) = Phi(x) + x * phi(x)."""
+    inv_sqrt2 = 1.0 / math.sqrt(2.0)
+    inv_sqrt2pi = 1.0 / math.sqrt(2.0 * math.pi)
+    cdf = 0.5 * (1.0 + torch.erf(x * inv_sqrt2))
+    pdf = torch.exp(-0.5 * x * x) * inv_sqrt2pi
+    return grad_output * (cdf + x * pdf)
+
+
+def _manual_memory_mlp_grad(
+    model: Module,
+    params: dict[str, Tensor],
+    keys: Tensor,
+    loss_weights: Tensor,
+    values: Tensor,
+    loss_fn: Callable,
+) -> tuple[dict[str, Tensor], Tensor]:
+    """
+    Manual batched gradient computation for MemoryMLP (with optional ResidualNorm).
+    Replaces vmap(grad(forward_and_loss)) with torch.bmm chain-rule.
+
+    Args:
+        model: The memory model (MemoryMLP or ResidualNorm(MemoryMLP))
+        params: Per-sample parameters dict {name: (B, ...)}
+        keys: Input tensor (B, c, d)
+        loss_weights: Per-token loss weights (B, c)
+        values: Target tensor (B, c, d)
+        loss_fn: Loss function (pred, target) -> per-token losses (B, c)
+
+    Returns:
+        grads: dict of per-sample gradients, same structure as params
+        losses: Unweighted per-token losses (B, c)
+    """
+    has_residnorm = isinstance(model, ResidualNorm)
+
+    # Extract MLP weight names in order
+    if has_residnorm:
+        mlp_weight_names = sorted(
+            [n for n in params if n.startswith('model.weights.')],
+            key=lambda n: int(n.split('.')[-1])
+        )
+        gamma_name = 'norm.gamma'
+    else:
+        mlp_weight_names = sorted(
+            [n for n in params if n.startswith('weights.')],
+            key=lambda n: int(n.split('.')[-1])
+        )
+        gamma_name = None
+
+    # Collect weight tensors
+    W = [params[n] for n in mlp_weight_names]  # list of (B, dim_in, dim_out)
+    depth = len(W)
+
+    # --- Forward pass (save intermediates) ---
+    activations = [keys]  # activations[0] = input
+    pre_gelu = []         # pre-activation values for GELU backward
+
+    x = keys
+    for i, w in enumerate(W):
+        if i > 0:
+            pre_gelu.append(x)  # save pre-gelu activation
+            x = F.gelu(x)
+        activations.append(x)  # save post-activation (or input for first layer)
+        x = torch.bmm(x, w)    # (B, c, dim_out)
+
+    mlp_out = x  # (B, c, d)
+
+    # --- ResidualNorm forward if applicable ---
+    if has_residnorm:
+        gamma = params[gamma_name]  # (B, d)
+        eps = 1e-5
+
+        mean = mlp_out.mean(dim=-1, keepdim=True)        # (B, c, 1)
+        var = mlp_out.var(dim=-1, keepdim=True, correction=0).clamp(min=0.)  # (B, c, 1)
+        std = (var + eps).sqrt()                            # (B, c, 1)
+        normed = (mlp_out - mean) / std                    # (B, c, d)
+
+        scale = gamma.unsqueeze(1) + 1.0  # (B, 1, d)
+        ln_out = normed * scale            # (B, c, d)
+        pred = ln_out + keys               # residual
+    else:
+        pred = mlp_out
+
+    # --- Loss ---
+    losses = loss_fn(pred, values)  # (B, c)
+    d = pred.shape[-1]
+
+    # --- Backward: initial gradient ---
+    # d(weighted_loss)/d(pred) where weighted_loss = (losses * loss_weights).sum()
+    diff = pred - values  # (B, c, d)
+    dL_dpred = 2.0 * diff / d * loss_weights.unsqueeze(-1)  # (B, c, d)
+
+    # --- Backward through ResidualNorm ---
+    if has_residnorm:
+        dL_dln_out = dL_dpred  # residual: gradient passes through addition
+
+        # Gradient for gamma
+        dL_dgamma = (dL_dln_out * normed).sum(dim=1)  # (B, d)
+
+        # Backward through LayerNorm
+        dL_dnormed = dL_dln_out * scale  # (B, c, d)
+
+        # Standard LayerNorm backward
+        dL_dmlp_out = (1.0 / std) * (
+            dL_dnormed
+            - dL_dnormed.mean(dim=-1, keepdim=True)
+            - normed * (dL_dnormed * normed).mean(dim=-1, keepdim=True)
+        )
+
+        grad_output = dL_dmlp_out
+    else:
+        grad_output = dL_dpred
+
+    # --- Backward through MLP layers ---
+    weight_grads = {}  # temporary dict for MLP weight grads
+
+    dL_dz = grad_output  # gradient w.r.t. output of last layer
+
+    for i in range(depth - 1, -1, -1):
+        # dL/dW_i = pre_act_i^T @ dL_dz_i
+        if i > 0:
+            pre_act = activations[i + 1]
+        else:
+            pre_act = activations[0]  # keys
+
+        weight_grads[mlp_weight_names[i]] = torch.bmm(
+            pre_act.transpose(-2, -1), dL_dz
+        )  # (B, dim_in, dim_out)
+
+        if i > 0:
+            # Propagate gradient to previous layer
+            dL_dact = torch.bmm(dL_dz, W[i].transpose(-2, -1))  # (B, c, dim_in)
+            # Backward through GELU
+            dL_dz = _gelu_backward(pre_gelu[i - 1], dL_dact)
+
+    if has_residnorm:
+        weight_grads[gamma_name] = dL_dgamma
+
+    # Rebuild grads dict preserving the SAME key order as input params
+    grads = {name: weight_grads[name] for name in params}
+
+    return grads, losses
+
+
 # multi head rmsnorm
 
 class MultiheadRMSNorm(Module):
@@ -291,6 +437,7 @@ class NeuralMemory(Module):
         spectral_norm_surprises = False,
         gated_transition = False,
         mem_model_norm_add_residual = True, # by default, layernorm output and add residual as proposed in TTT paper, but could be removed
+        use_manual_grad = True, # use manual batched matmul gradient instead of vmap(grad()) - much faster on GPU
         default_model_kwargs: dict = dict(
             depth = 2,
             expansion_factor = 4.
@@ -393,19 +540,38 @@ class NeuralMemory(Module):
 
         self.chunk_size = chunk_size
 
-        # prepare function for per sample gradients from model above, using torch.func
+        # prepare function for per sample gradients from model above
+        # use_manual_grad: batched matmul chain-rule (fast) vs vmap(grad()) (general)
 
-        def forward_and_loss(params, inputs, loss_weights, target):
-            pred = functional_call(self.memory_model, params, inputs)
-            loss = self.store_memory_loss_fn(pred, target) # simple mse loss in paper - eq (12) - |M(k) - v|²
-            weighted_loss = loss * loss_weights
-            return weighted_loss.sum(), loss
+        def is_manual_grad_compatible():
+            """Check if memory model supports manual gradient (MemoryMLP +/- ResidualNorm)."""
+            m = self.memory_model
+            if isinstance(m, ResidualNorm):
+                m = m.model
+            return isinstance(m, MemoryMLP)
 
-        # two functions
+        can_use_manual_grad = use_manual_grad and is_manual_grad_compatible()
 
-        grad_fn = grad(forward_and_loss, has_aux = True)
+        self.store_memory_loss_fn = store_memory_loss_fn
 
-        self.per_sample_grad_fn = vmap(grad_fn, in_dims = (0, 0, 0, 0))
+        if can_use_manual_grad:
+            memory_model = self.memory_model
+            loss_fn = store_memory_loss_fn
+
+            def manual_grad_fn(params, inputs, loss_weights, target):
+                return _manual_memory_mlp_grad(memory_model, params, inputs, loss_weights, target, loss_fn)
+
+            self.per_sample_grad_fn = manual_grad_fn
+        else:
+            def forward_and_loss(params, inputs, loss_weights, target):
+                pred = functional_call(self.memory_model, params, inputs)
+                loss = self.store_memory_loss_fn(pred, target) # simple mse loss in paper - eq (12) - |M(k) - v|²
+                weighted_loss = loss * loss_weights
+                return weighted_loss.sum(), loss
+
+            grad_fn = grad(forward_and_loss, has_aux = True)
+
+            self.per_sample_grad_fn = vmap(grad_fn, in_dims = (0, 0, 0, 0))
 
         # queries for retrieving from the model
 
@@ -424,8 +590,6 @@ class NeuralMemory(Module):
             LinearNoBias(dim, dim_inner * num_kv_per_token),
             activation,
         )
-
-        self.store_memory_loss_fn = store_memory_loss_fn
 
         self.num_kv_per_token = num_kv_per_token
 
