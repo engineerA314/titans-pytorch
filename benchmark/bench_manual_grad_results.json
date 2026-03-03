@@ -1,0 +1,123 @@
+{
+  "benchmark": "titans_manual_grad",
+  "gpu": "NVIDIA A100-SXM4-80GB",
+  "gpu_mem_gb": 79.3,
+  "pytorch_version": "2.10.0+cu128",
+  "timestamp": "2026-02-24T02:44:23.231159",
+  "configs": {
+    "0.5B": {
+      "dim": "896",
+      "heads": "14",
+      "dim_head": "64",
+      "chunk_size": "64",
+      "batch_size": "4",
+      "model_kwargs": "{'depth': 2, 'expansion_factor': 4.0}"
+    },
+    "3B": {
+      "dim": "2048",
+      "heads": "32",
+      "dim_head": "64",
+      "chunk_size": "64",
+      "batch_size": "2",
+      "model_kwargs": "{'depth': 2, 'expansion_factor': 4.0}"
+    }
+  },
+  "results": [
+    {
+      "config": "0.5B",
+      "backend": "vmap(grad)",
+      "seq_len": 512,
+      "batch_size": 4,
+      "peak_mem_gb": 0.6299,
+      "fwd_ms": 15.12,
+      "bwd_ms": 14.96,
+      "total_ms": 30.09,
+      "tok_per_sec": 68071,
+      "oom": false
+    },
+    {
+      "config": "0.5B",
+      "backend": "manual_grad",
+      "seq_len": 512,
+      "batch_size": 4,
+      "peak_mem_gb": 0.6999,
+      "fwd_ms": 14.21,
+      "bwd_ms": 16.64,
+      "total_ms": 30.85,
+      "tok_per_sec": 66379,
+      "oom": false
+    },
+    {
+      "config": "0.5B",
+      "backend": "vmap(grad)",
+      "seq_len": 2048,
+      "batch_size": 4,
+      "peak_mem_gb": 2.3707,
+      "fwd_ms": 26.02,
+      "bwd_ms": 47.41,
+      "total_ms": 73.43,
+      "tok_per_sec": 111562,
+      "oom": false
+    },
+    {
+      "config": "0.5B",
+      "backend": "manual_grad",
+      "seq_len": 2048,
+      "batch_size": 4,
+      "peak_mem_gb": 2.6568,
+      "fwd_ms": 21.53,
+      "bwd_ms": 39.3,
+      "total_ms": 60.83,
+      "tok_per_sec": 134664,
+      "oom": false
+    },
+    {
+      "config": "3B",
+      "backend": "vmap(grad)",
+      "seq_len": 512,
+      "batch_size": 2,
+      "peak_mem_gb": 0.728,
+      "fwd_ms": 15.46,
+      "bwd_ms": 15.79,
+      "total_ms": 31.26,
+      "tok_per_sec": 32762,
+      "oom": false
+    },
+    {
+      "config": "3B",
+      "backend": "manual_grad",
+      "seq_len": 512,
+      "batch_size": 2,
+      "peak_mem_gb": 0.8086,
+      "fwd_ms": 13.62,
+      "bwd_ms": 14.84,
+      "total_ms": 28.47,
+      "tok_per_sec": 35973,
+      "oom": false
+    },
+    {
+      "config": "3B",
+      "backend": "vmap(grad)",
+      "seq_len": 2048,
+      "batch_size": 2,
+      "peak_mem_gb": 2.724,
+      "fwd_ms": 20.63,
+      "bwd_ms": 32.89,
+      "total_ms": 53.52,
+      "tok_per_sec": 76525,
+      "oom": false
+    },
+    {
+      "config": "3B",
+      "backend": "manual_grad",
+      "seq_len": 2048,
+      "batch_size": 2,
+      "peak_mem_gb": 3.0534,
+      "fwd_ms": 18.82,
+      "bwd_ms": 34.05,
+      "total_ms": 52.87,
+      "tok_per_sec": 77480,
+      "oom": false
+    }
+  ]
+}

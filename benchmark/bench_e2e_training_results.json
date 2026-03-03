@@ -1,0 +1,49 @@
+{
+  "benchmark": "titans_e2e_training",
+  "gpu": "NVIDIA A100-SXM4-80GB",
+  "gpu_mem_gb": 79.3,
+  "pytorch_version": "2.10.0+cu128",
+  "timestamp": "2026-02-24T03:15:50.520523",
+  "results": [
+    {
+      "config": "0.5B",
+      "backend": "vmap(grad)",
+      "num_params": 40223184,
+      "peak_mem_gb": 32.328,
+      "tok_per_sec": 1279,
+      "ms_per_step": 400.3,
+      "n_steps": 50,
+      "oom": false
+    },
+    {
+      "config": "0.5B",
+      "backend": "manual_grad",
+      "num_params": 40223184,
+      "peak_mem_gb": 30.408,
+      "tok_per_sec": 1298,
+      "ms_per_step": 394.4,
+      "n_steps": 50,
+      "oom": false
+    },
+    {
+      "config": "3B",
+      "backend": "vmap(grad)",
+      "num_params": 103374484,
+      "peak_mem_gb": 20.477,
+      "tok_per_sec": 1125,
+      "ms_per_step": 227.6,
+      "n_steps": 50,
+      "oom": false
+    },
+    {
+      "config": "3B",
+      "backend": "manual_grad",
+      "num_params": 103374484,
+      "peak_mem_gb": 19.493,
+      "tok_per_sec": 1146,
+      "ms_per_step": 223.4,
+      "n_steps": 50,
+      "oom": false
+    }
+  ]
+}
